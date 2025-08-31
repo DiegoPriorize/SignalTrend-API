@@ -11,7 +11,7 @@ import uvicorn
 from datetime import datetime, timezone
 import json
 
-app = FastAPI(title="Signals API", version="1.1.0",
+app = FastAPI(title="Signals API", version="1.1.1",
               description="Gera sinais (COMPRA/VENDA/NEUTRO) com indicadores técnicos e previsões curtas.")
 
 # -----------------------------
@@ -107,7 +107,11 @@ def true_range(high, low, close):
     tr = np.empty_like(close)
     tr[0] = high[0] - low[0]
     for i in range(1, len(close)):
-        tr[i] = max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1]))
+        tr[i] = max(
+            high[i] - low[i],
+            abs(high[i] - close[i - 1]),
+            abs(low[i] - close[i - 1])
+        )
     return tr
 
 def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14):
@@ -296,12 +300,12 @@ def analyze(data: Payload) -> Dict[str, Any]:
             buy_score += cfg.w_ma_cross; reasons.append("EMA curto acima de EMA longo (tendência de alta).")
         elif ema_s[-1] < ema_l[-1]:
             sell_score += cfg.w_ma_cross; reasons.append("EMA curto abaixo de EMA longo (tendência de baixa).")
-    ema_slope = slope(ema_s, min(5, len(ema_s)))
-    if ema_slope > 0: buy_score += 0.2
-    elif ema_slope < 0: sell_score += 0.2
+    ema_slope_val = slope(ema_s, min(5, len(ema_s)))
+    if ema_slope_val > 0: buy_score += 0.2
+    elif ema_slope_val < 0: sell_score += 0.2
 
-    # 2) MACD + hist slope
-    if not math.isnan(macd_line[-1]) and not math.isnan(macd_sig[-1])):
+    # 2) MACD + hist slope  (corrigido: sem parêntese extra)
+    if not math.isnan(macd_line[-1]) and not math.isnan(macd_sig[-1]):
         if macd_line[-1] > macd_sig[-1]:
             buy_score += cfg.w_macd; reasons.append("MACD acima da linha de sinal.")
         elif macd_line[-1] < macd_sig[-1]:
@@ -310,22 +314,22 @@ def analyze(data: Payload) -> Dict[str, Any]:
         if hsl > 0: buy_score += 0.2
         elif hsl < 0: sell_score += 0.2
 
-    # 3) RSI
-    if not math.isnan(rsi_val[-1])):
+    # 3) RSI  (corrigido)
+    if not math.isnan(rsi_val[-1]):
         if rsi_val[-1] < cfg.rsi_buy:
             buy_score += cfg.w_rsi; reasons.append(f"RSI {rsi_val[-1]:.1f} (sobrevendido).")
         elif rsi_val[-1] > cfg.rsi_sell:
             sell_score += cfg.w_rsi; reasons.append(f"RSI {rsi_val[-1]:.1f} (sobrecomprado).")
 
-    # 4) Bollinger
-    if not math.isnan(bb_up[-1]) and not math.isnan(bb_lo[-1])):
+    # 4) Bollinger  (corrigido)
+    if not math.isnan(bb_up[-1]) and not math.isnan(bb_lo[-1]):
         if C[-1] <= bb_lo[-1]:
             buy_score += cfg.w_bb; reasons.append("Preço tocou/abaixo da banda inferior (reversão provável).")
         elif C[-1] >= bb_up[-1]:
             sell_score += cfg.w_bb; reasons.append("Preço tocou/acima da banda superior (reversão provável).")
 
-    # 5) Estocástico
-    if not math.isnan(stoch_k[-1]) and not math.isnan(stoch_d[-1])):
+    # 5) Estocástico  (corrigido)
+    if not math.isnan(stoch_k[-1]) and not math.isnan(stoch_d[-1]):
         prev_ok = (len(stoch_k) >= 2 and len(stoch_d) >= 2 and not math.isnan(stoch_k[-2]) and not math.isnan(stoch_d[-2]))
         if (stoch_k[-1] < cfg.stoch_buy) and (prev_ok and stoch_k[-2] <= stoch_d[-2]) and (stoch_k[-1] > stoch_d[-1]):
             buy_score += cfg.w_stoch; reasons.append("Estocástico: %K cruzou acima de %D em região de sobrevenda.")
