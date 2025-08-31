@@ -258,6 +258,33 @@ class Payload(BaseModel):
 # -----------------------------
 
 def analyze(data: Payload) -> Dict[str, Any]:
+    # Blindagem extra: sempre coagir para lista, mesmo que Pydantic não tenha feito
+    def as_list_str(x):
+        # reutiliza a mesma lógica do modelo
+        return Payload._coerce_to_list_str(x)
+
+    T_list = as_list_str(data.T)
+    O_list = as_list_str(data.O)
+    H_list = as_list_str(data.H)
+    C_list = as_list_str(data.C)
+    V_list = as_list_str(data.V)
+
+    # Trata 'L' ou 'I' (compat)
+    if data.L is not None:
+        L_list = as_list_str(data.L)
+    elif data.I is not None:
+        L_list = as_list_str(data.I)
+    else:
+        raise ValueError("Forneça 'L' (low) ou 'I' (compatibilidade)")
+
+    # Converte para numpy
+    T = np.array([int(t) for t in T_list], dtype=np.int64)
+    O = to_float_array(O_list)
+    H = to_float_array(H_list)
+    C = to_float_array(C_list)
+    V = to_float_array(V_list)
+    L = to_float_array(L_list)
+
     T = np.array([int(t) for t in data.T], dtype=np.int64)
     O = to_float_array(data.O)
     H = to_float_array(data.H)
