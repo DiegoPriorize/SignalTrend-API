@@ -1,26 +1,125 @@
 # main.py
-# API de sinais de trading (COMPRA/VENDA/NEUTRO) com múltiplos indicadores
-# Execução local:  uvicorn main:app --host 0.0.0.0 --port 8080
+# Signals API COMPLETA — compatível com FlutterFlow, CSV e JSON-string.
+# Run local: uvicorn main:app --host 0.0.0.0 --port 8080
 
 from typing import List, Optional, Dict, Any, Literal, Union
 from fastapi import FastAPI, Body
-from pydantic import BaseModel, Field
-import numpy as np
-import math
-import uvicorn
+from pydantic import BaseModel
 from datetime import datetime, timezone
-import json
+import numpy as np
+import math, json
+import uvicorn
 
-app = FastAPI(title="Signals API", version="1.2.0",
-              description="Gera sinais (COMPRA/VENDA/NEUTRO) com indicadores técnicos e previsões curtas.")
+app = FastAPI(
+    title="Signals API (Full)",
+    version="1.3.0",
+    description=(
+        "API de sinais (COMPRA/VENDA/NEUTRO) usando EMA/SMA/WMA, RSI, MACD, Bollinger, "
+        "Estocástico, ADX/DI, Fibonacci e Volume; previsões curtas (≤30 min). "
+        "Compatível com campos do FlutterFlow e nomes clássicos; aceita listas, CSV e JSON-string."
+    ),
+)
 
 # -----------------------------
-# Utils numéricos
+# Config
 # -----------------------------
+class Config(BaseModel):
+    # Períodos
+    sma_short: int = 9
+    sma_long: int = 21
+    ema_short: int = 12
+    ema_long: int = 26
+    wma_period: int = 10
+    rsi_period: int = 14
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+    bb_period: int = 20
+    bb_mult: float = 2.0
+    stoch_k: int = 14
+    stoch_d: int = 3
+    adx_period: int = 14
+    fib_lookback: int = 120
+    # Pesos (votação)
+    w_ma_cross: float = 1.2
+    w_macd: float = 1.2
+    w_rsi: float = 1.0
+    w_bb: float = 0.8
+    w_stoch: float = 0.8
+    w_adx_trend: float = 0.8
+    w_volume_confirm: float = 0.6  # reservado (v1 usa multiplicador)
+    # Limiares
+    rsi_buy: int = 30
+    rsi_sell: int = 70
+    stoch_buy: int = 20
+    stoch_sell: int = 80
+    adx_trend_min: int = 25
+    # Previsões
+    future_points: int = 5
+    future_max_minutes: int = 30
+    forecast_bias: Literal["trend", "mean_revert", "auto"] = "auto"
+
+# -----------------------------
+# Payload (aceita aliases do FF e nomes clássicos; lista/CSV/JSON-string)
+# -----------------------------
+class Payload(BaseModel):
+    # Clássicos
+    T: Optional[Union[List[str], str]] = None
+    O: Optional[Union[List[str], str]] = None
+    H: Optional[Union[List[str], str]] = None
+    L: Optional[Union[List[str], str]] = None
+    I: Optional[Union[List[str], str]] = None  # compat para low
+    C: Optional[Union[List[str], str]] = None
+    V: Optional[Union[List[str], str]] = None
+    # Aliases (FlutterFlow)
+    saidaInteger: Optional[Union[List[str], str]] = None
+    saidaPrecoAbertura: Optional[Union[List[str], str]] = None
+    saidaPrecoFechamento: Optional[Union[List[str], str]] = None
+    saidaMaximaPeriodo: Optional[Union[List[str], str]] = None
+    saidaMinimaPeriodo: Optional[Union[List[str], str]] = None
+    saidaVolume: Optional[Union[List[str], str]] = None
+    # Config
+    config: Optional[Config] = None
+
+# -----------------------------
+# Utils gerais
+# -----------------------------
+def _coerce_to_list_str(v):
+    """Aceita lista, número, CSV ('1,2,3') ou JSON-string ('[\"1\",\"2\"]') e devolve List[str]."""
+    if v is None:
+        return None
+    if isinstance(v, list):
+        return [str(x) for x in v]
+    if isinstance(v, (int, float)):
+        return [str(v)]
+    if isinstance(v, str):
+        s = v.strip()
+        if s.startswith('[') and s.endswith(']'):
+            try:
+                arr = json.loads(s)
+                return [str(x) for x in arr]
+            except Exception:
+                pass
+        return [p.strip() for p in s.replace(';', ',').split(',') if p.strip()]
+    return [str(v)]
 
 def to_float_array(xs: List[str]) -> np.ndarray:
     return np.array([float(x) for x in xs], dtype=float)
 
+def pct(x: float) -> float:
+    return float(max(0.0, min(100.0, x)))
+
+def try_float(x):
+    try:
+        if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+# -----------------------------
+# Indicadores (numpy, sem libs externas)
+# -----------------------------
 def ema(arr: np.ndarray, period: int) -> np.ndarray:
     if period <= 1:
         return arr.copy()
@@ -33,8 +132,7 @@ def ema(arr: np.ndarray, period: int) -> np.ndarray:
     return out
 
 def sma(arr: np.ndarray, period: int) -> np.ndarray:
-    if period <= 1:
-        return arr.copy()
+    if period <= 1: return arr.copy()
     if len(arr) < period:
         out = np.empty_like(arr); out[:] = np.nan; return out
     csum = np.cumsum(np.insert(arr, 0, 0.0))
@@ -43,8 +141,7 @@ def sma(arr: np.ndarray, period: int) -> np.ndarray:
     return np.concatenate([pad, res])
 
 def wma(arr: np.ndarray, period: int) -> np.ndarray:
-    if period <= 1:
-        return arr.copy()
+    if period <= 1: return arr.copy()
     if len(arr) < period:
         out = np.empty_like(arr); out[:] = np.nan; return out
     weights = np.arange(1, period + 1)
@@ -132,8 +229,7 @@ def adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14):
 
 def fib_retracements(high: np.ndarray, low: np.ndarray, lookback: int = 120):
     n = len(high)
-    if n == 0:
-        return {}
+    if n == 0: return {}
     start = max(0, n - lookback)
     swin_hi = np.max(high[start:])
     swin_lo = np.min(low[start:])
@@ -149,178 +245,82 @@ def fib_retracements(high: np.ndarray, low: np.ndarray, lookback: int = 120):
     }
 
 def slope(arr: np.ndarray, window: int = 5) -> float:
-    if len(arr) < window:
-        return 0.0
-    y = arr[-window:]
-    x = np.arange(window)
+    if len(arr) < window: return 0.0
+    y = arr[-window:]; x = np.arange(window)
     x_mean = np.mean(x); y_mean = np.mean(y)
     num = np.sum((x - x_mean) * (y - y_mean))
     den = np.sum((x - x_mean) ** 2)
     return float(num / den) if den != 0 else 0.0
 
-def pct(x: float) -> float:
-    return float(max(0.0, min(100.0, x)))
-
-def try_float(x):
-    try:
-        if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
-            return None
-        return float(x)
-    except Exception:
-        return None
-
 # -----------------------------
-# Config
+# Normalização de entrada
 # -----------------------------
-
-class Config(BaseModel):
-    # Períodos
-    sma_short: int = 9
-    sma_long: int = 21
-    ema_short: int = 12
-    ema_long: int = 26
-    wma_period: int = 10
-    rsi_period: int = 14
-    macd_fast: int = 12
-    macd_slow: int = 26
-    macd_signal: int = 9
-    bb_period: int = 20
-    bb_mult: float = 2.0
-    stoch_k: int = 14
-    stoch_d: int = 3
-    adx_period: int = 14
-    fib_lookback: int = 120
-    # Pesos
-    w_ma_cross: float = 1.2
-    w_macd: float = 1.2
-    w_rsi: float = 1.0
-    w_bb: float = 0.8
-    w_stoch: float = 0.8
-    w_adx_trend: float = 0.8
-    w_volume_confirm: float = 0.6
-    # Thresholds
-    rsi_buy: int = 30
-    rsi_sell: int = 70
-    stoch_buy: int = 20
-    stoch_sell: int = 80
-    adx_trend_min: int = 25
-    # Previsões
-    future_points: int = 5
-    future_max_minutes: int = 30
-    forecast_bias: Literal["trend","mean_revert","auto"] = "auto"
-
-# -----------------------------
-# Entrada crua (aceita ambos nomes)
-# -----------------------------
-
-class RawPayload(BaseModel):
-    # nomes clássicos
-    T: Optional[Union[List[str], str]] = None
-    O: Optional[Union[List[str], str]] = None
-    H: Optional[Union[List[str], str]] = None
-    L: Optional[Union[List[str], str]] = None
-    I: Optional[Union[List[str], str]] = None
-    C: Optional[Union[List[str], str]] = None
-    V: Optional[Union[List[str], str]] = None
-    # nomes do FlutterFlow (seus)
-    saidaInteger: Optional[Union[List[str], str]] = None
-    saidaPrecoAbertura: Optional[Union[List[str], str]] = None
-    saidaPrecoFechamento: Optional[Union[List[str], str]] = None
-    saidaMaximaPeriodo: Optional[Union[List[str], str]] = None
-    saidaMinimaPeriodo: Optional[Union[List[str], str]] = None
-    saidaVolume: Optional[Union[List[str], str]] = None
-
-    config: Optional[Config] = None
-
-# -----------------------------
-# Normalização e parsing
-# -----------------------------
-
-def _coerce_to_list_str(v):
-    """Aceita lista, número, CSV ou JSON-string e devolve List[str]."""
-    if v is None:
-        return None
-    if isinstance(v, list):
-        return [str(x) for x in v]
-    if isinstance(v, (int, float)):
-        return [str(v)]
-    if isinstance(v, str):
-        s = v.strip()
-        # JSON-string de array
-        if s.startswith('[') and s.endswith(']'):
-            try:
-                arr = json.loads(s)
-                return [str(x) for x in arr]
-            except Exception:
-                pass
-        # CSV (aceita ';')
-        return [p.strip() for p in s.replace(';', ',').split(',') if p.strip()]
-    return [str(v)]
-
-def normalize_payload(p: RawPayload):
-    # escolher fonte por prioridade (clássico → alternativo)
+def normalize_payload(p: Payload):
     T_raw = p.T if p.T is not None else p.saidaInteger
     O_raw = p.O if p.O is not None else p.saidaPrecoAbertura
     C_raw = p.C if p.C is not None else p.saidaPrecoFechamento
     H_raw = p.H if p.H is not None else p.saidaMaximaPeriodo
-    L_raw = p.L if p.L is not None else p.saidaMinimaPeriodo
-    I_raw = p.I  # compat
+    L_raw = p.L if p.L is not None else (p.saidaMinimaPeriodo if p.saidaMinimaPeriodo is not None else p.I)
     V_raw = p.V if p.V is not None else p.saidaVolume
 
-    T = _coerce_to_list_str(T_raw) or []
-    O = _coerce_to_list_str(O_raw) or []
-    C = _coerce_to_list_str(C_raw) or []
-    H = _coerce_to_list_str(H_raw) or []
-    V = _coerce_to_list_str(V_raw) or []
+    if not all([T_raw, O_raw, C_raw, H_raw, L_raw, V_raw]):
+        raise ValueError("Faltando campos obrigatórios (T/O/H/L/C/V) ou seus aliases.")
 
-    # Low pode vir em L (preferido), I (compat) ou saidaMinimaPeriodo
-    if L_raw is not None:
-        L = _coerce_to_list_str(L_raw)
-    elif I_raw is not None:
-        L = _coerce_to_list_str(I_raw)
-    else:
-        L = None
+    T_list = _coerce_to_list_str(T_raw) or []
+    O_list = _coerce_to_list_str(O_raw) or []
+    C_list = _coerce_to_list_str(C_raw) or []
+    H_list = _coerce_to_list_str(H_raw) or []
+    L_list = _coerce_to_list_str(L_raw) or []
+    V_list = _coerce_to_list_str(V_raw) or []
 
-    return T, O, H, L, C, V, (p.config or Config())
+    T = np.array([int(t) for t in T_list], dtype=np.int64)
+    O = to_float_array(O_list)
+    C = to_float_array(C_list)
+    H = to_float_array(H_list)
+    L = to_float_array(L_list)
+    V = to_float_array(V_list)
+
+    n = len(T)
+    if not (len(O) == len(H) == len(L) == len(C) == len(V) == n):
+        raise ValueError("Todos os arrays devem ter o mesmo tamanho.")
+
+    cfg = p.config or Config()
+    # clamps simples
+    cfg.future_points = int(max(1, min(5, cfg.future_points)))
+    cfg.future_max_minutes = int(max(1, min(30, cfg.future_max_minutes)))
+
+    return T, O, H, L, C, V, cfg
 
 # -----------------------------
 # Núcleo de análise
 # -----------------------------
-
-def analyze_arrays(T_list, O_list, H_list, L_list, C_list, V_list, cfg: Config) -> Dict[str, Any]:
-    if L_list is None:
-        raise ValueError("Forneça 'L' (low) ou 'I' (compatibilidade)")
-
-    # Converte para numpy
-    T = np.array([int(t) for t in T_list], dtype=np.int64)
-    O = to_float_array(O_list)
-    H = to_float_array(H_list)
-    C = to_float_array(C_list)
-    V = to_float_array(V_list)
-    L = to_float_array(L_list)
-
-    n = len(T)
-    if not (len(O) == len(H) == len(L) == len(C) == len(V) == n):
-        raise ValueError("Todos os arrays devem ter o mesmo tamanho")
-
+def analyze_arrays(T, O, H, L, C, V, cfg: Config) -> Dict[str, Any]:
     # Indicadores
     sma_s = sma(C, cfg.sma_short); sma_l = sma(C, cfg.sma_long)
     ema_s = ema(C, cfg.ema_short); ema_l = ema(C, cfg.ema_long)
     wma_p = wma(C, cfg.wma_period)
-    rsi_val = rsi(C, cfg.rsi_period)
+    rsi_v = rsi(C, cfg.rsi_period)
     macd_line, macd_sig, macd_hist = macd(C, cfg.macd_fast, cfg.macd_slow, cfg.macd_signal)
     bb_mid, bb_up, bb_lo = bollinger(C, cfg.bb_period, cfg.bb_mult)
     stoch_k, stoch_d = stochastic(H, L, C, cfg.stoch_k, cfg.stoch_d)
     adx_line, plus_di, minus_di = adx(H, L, C, cfg.adx_period)
     fibs = fib_retracements(H, L, cfg.fib_lookback)
 
-    # Volume médio
+    # Volume médio e boost
+    n = len(T)
     vol_ma = sma(V, max(5, min(20, n)))
     vol_boost = 1.0
-    reasons = []
-    buy_score = 0.0; sell_score = 0.0
+    if not math.isnan(vol_ma[-1]):
+        if V[-1] > vol_ma[-1] * 1.2:
+            vol_boost = 1.15
+        elif V[-1] < vol_ma[-1] * 0.8:
+            vol_boost = 0.9
 
-    # 1) EMA cross + slope
+    reasons: List[str] = []
+    buy_score = 0.0
+    sell_score = 0.0
+
+    # 1) EMA cross + inclinação
     if not math.isnan(ema_s[-1]) and not math.isnan(ema_l[-1]):
         if ema_s[-1] > ema_l[-1]:
             buy_score += cfg.w_ma_cross; reasons.append("EMA curto acima de EMA longo (tendência de alta).")
@@ -341,11 +341,11 @@ def analyze_arrays(T_list, O_list, H_list, L_list, C_list, V_list, cfg: Config) 
         elif hsl < 0: sell_score += 0.2
 
     # 3) RSI
-    if not math.isnan(rsi_val[-1]):
-        if rsi_val[-1] < cfg.rsi_buy:
-            buy_score += cfg.w_rsi; reasons.append(f"RSI {rsi_val[-1]:.1f} (sobrevendido).")
-        elif rsi_val[-1] > cfg.rsi_sell:
-            sell_score += cfg.w_rsi; reasons.append(f"RSI {rsi_val[-1]:.1f} (sobrecomprado).")
+    if not math.isnan(rsi_v[-1]):
+        if rsi_v[-1] < cfg.rsi_buy:
+            buy_score += cfg.w_rsi; reasons.append(f"RSI {rsi_v[-1]:.1f} (sobrevendido).")
+        elif rsi_v[-1] > cfg.rsi_sell:
+            sell_score += cfg.w_rsi; reasons.append(f"RSI {rsi_v[-1]:.1f} (sobrecomprado).")
 
     # 4) Bollinger
     if not math.isnan(bb_up[-1]) and not math.isnan(bb_lo[-1]):
@@ -358,9 +358,9 @@ def analyze_arrays(T_list, O_list, H_list, L_list, C_list, V_list, cfg: Config) 
     if not math.isnan(stoch_k[-1]) and not math.isnan(stoch_d[-1]):
         prev_ok = (len(stoch_k) >= 2 and len(stoch_d) >= 2 and not math.isnan(stoch_k[-2]) and not math.isnan(stoch_d[-2]))
         if (stoch_k[-1] < cfg.stoch_buy) and (prev_ok and stoch_k[-2] <= stoch_d[-2]) and (stoch_k[-1] > stoch_d[-1]):
-            buy_score += cfg.w_stoch; reasons.append("Estocástico: %K cruzou acima de %D em região de sobrevenda.")
+            buy_score += cfg.w_stoch; reasons.append("%K cruzou acima de %D em sobrevenda.")
         if (stoch_k[-1] > cfg.stoch_sell) and (prev_ok and stoch_k[-2] >= stoch_d[-2]) and (stoch_k[-1] < stoch_d[-1]):
-            sell_score += cfg.w_stoch; reasons.append("Estocástico: %K cruzou abaixo de %D em região de sobrecompra.")
+            sell_score += cfg.w_stoch; reasons.append("%K cruzou abaixo de %D em sobrecompra.")
 
     # 6) ADX reforço
     adx_last = adx_line[-1] if not math.isnan(adx_line[-1]) else np.nan
@@ -370,32 +370,30 @@ def analyze_arrays(T_list, O_list, H_list, L_list, C_list, V_list, cfg: Config) 
         if ema_s[-1] < ema_l[-1] and macd_line[-1] < macd_sig[-1]:
             sell_score += cfg.w_adx_trend; reasons.append(f"ADX {adx_last:.1f} (tendência forte pró-venda).")
 
-    # 7) Volume (multiplicador)
-    if not math.isnan(vol_ma[-1]):
-        if V[-1] > vol_ma[-1] * 1.2:
-            vol_boost = 1.15; reasons.append("Volume acima da média (confirmação).")
-        elif V[-1] < vol_ma[-1] * 0.8:
-            vol_boost = 0.9; reasons.append("Volume abaixo da média (confirmação fraca).")
+    # Volume multiplica o total
+    buy_score *= vol_boost
+    sell_score *= vol_boost
 
-    buy_score *= vol_boost; sell_score *= vol_boost
-
+    # Sinal + confiança
     total = buy_score + sell_score
     if total == 0:
         signal = "NEUTRO"; confidence = 50.0
     else:
-        prob_buy = buy_score / total; prob_sell = sell_score / total
-        if prob_buy > prob_sell:
-            signal = "COMPRA"; confidence = pct(50 + 50 * (prob_buy - prob_sell))
-        elif prob_sell > prob_buy:
-            signal = "VENDA"; confidence = pct(50 + 50 * (prob_sell - prob_buy))
+        pb = buy_score / total; ps = sell_score / total
+        if pb > ps:
+            signal = "COMPRA"; confidence = pct(50 + 50 * (pb - ps))
+        elif ps > pb:
+            signal = "VENDA"; confidence = pct(50 + 50 * (ps - pb))
         else:
             signal = "NEUTRO"; confidence = 50.0
 
-    if len(reasons) == 0:
+    if not reasons:
         reasons.append("Sem confluência suficiente; sinal neutro.")
 
-    future = forecast_short(T, O, H, L, C, V, cfg, adx_last, ema_s, ema_l, macd_line, macd_sig, rsi_val, bb_mid, bb_up, bb_lo)
+    # Previsões curtas
+    future = forecast_short(T, O, H, L, C, V, cfg, adx_last, ema_s, ema_l, macd_line, macd_sig, rsi_v, bb_mid, bb_up, bb_lo)
 
+    # Snapshot
     snap = {
         "price": try_float(C[-1]),
         "sma_short": try_float(sma_s[-1]),
@@ -403,7 +401,7 @@ def analyze_arrays(T_list, O_list, H_list, L_list, C_list, V_list, cfg: Config) 
         "ema_short": try_float(ema_s[-1]),
         "ema_long": try_float(ema_l[-1]),
         "wma": try_float(wma_p[-1]),
-        "rsi": try_float(rsi_val[-1]),
+        "rsi": try_float(rsi_v[-1]),
         "macd": try_float(macd_line[-1]),
         "macd_signal": try_float(macd_sig[-1]),
         "macd_hist": try_float(macd_hist[-1]),
@@ -416,8 +414,8 @@ def analyze_arrays(T_list, O_list, H_list, L_list, C_list, V_list, cfg: Config) 
         "plus_di": try_float(plus_di[-1]),
         "minus_di": try_float(minus_di[-1]),
         "volume": try_float(V[-1]),
-        "volume_ma": try_float(sma(V, max(5, min(20, n)))[-1]),
-        "fib_levels": fibs
+        "volume_ma": try_float(sma(V, max(5, min(20, len(V))))[-1]),
+        "fib_levels": fibs,
     }
 
     return {
@@ -426,27 +424,26 @@ def analyze_arrays(T_list, O_list, H_list, L_list, C_list, V_list, cfg: Config) 
         "precisao_pct": round(confidence, 1),
         "motivos": reasons,
         "indicadores": snap,
-        "futuros": future
+        "futuros": future,
     }
 
-def forecast_short(T, O, H, L, C, V, cfg: Config, adx_last, ema_s, ema_l, macd_line, macd_sig, rsi_val, bb_mid, bb_up, bb_lo):
-    # passo temporal (mediana dos deltas)
+def forecast_short(T, O, H, L, C, V, cfg: Config, adx_last, ema_s, ema_l, macd_line, macd_sig, rsi_v, bb_mid, bb_up, bb_lo):
+    # passo (mediana dos deltas)
     if len(T) >= 2:
         deltas = np.diff(T)
         step = int(np.median(deltas))
-        if step <= 0: step = int(deltas[-1]) if len(deltas) else 60
+        if step <= 0:
+            step = int(deltas[-1]) if len(deltas) else 60
     else:
         step = 60
+
     max_steps = max(1, min(cfg.future_points, int((cfg.future_max_minutes * 60) // step)))
-    if max_steps > 5: max_steps = 5
-    if max_steps == 0: return []
+    max_steps = min(5, max_steps)
+    if max_steps <= 0: return []
 
     mode = cfg.forecast_bias
     if mode == "auto":
-        if not math.isnan(adx_last) and adx_last >= cfg.adx_trend_min:
-            mode = "trend"
-        else:
-            mode = "mean_revert"
+        mode = "trend" if (not math.isnan(adx_last) and adx_last >= cfg.adx_trend_min) else "mean_revert"
 
     last_price = C[-1]
     ema_slope_recent = slope(ema_s, min(5, len(ema_s)))
@@ -457,7 +454,7 @@ def forecast_short(T, O, H, L, C, V, cfg: Config, adx_last, ema_s, ema_l, macd_l
 
     points = []
     ts = int(T[-1])
-    for i in range(1, max_steps + 1):
+    for _ in range(max_steps):
         ts += step
         if mode == "trend":
             drift = 0.2 * ema_slope_recent + 0.15 * macd_slope_recent
@@ -469,7 +466,9 @@ def forecast_short(T, O, H, L, C, V, cfg: Config, adx_last, ema_s, ema_l, macd_l
         noise = math.sin(ts % 1000) * (vol * 0.1)
         next_price = max(0.0001, last_price + drift + noise)
 
-        future_signal, prob, why = classify_future(next_price, ema_s[-1], ema_l[-1], rsi_val[-1], bb_up[-1], bb_lo[-1])
+        future_signal, prob, why = classify_future(
+            next_price, ema_s[-1], ema_l[-1], rsi_v[-1], bb_up[-1], bb_lo[-1]
+        )
         points.append({"timestamp": ts, "operacao": future_signal, "porcentagem": round(prob, 1), "motivo": why})
         last_price = next_price
 
@@ -503,22 +502,20 @@ def classify_future(price, ema_s_last, ema_l_last, rsi_last, bb_up_last, bb_lo_l
 # -----------------------------
 # Endpoints
 # -----------------------------
-
 @app.get("/health")
 def health():
     return {"status": "ok", "utc": datetime.now(timezone.utc).isoformat()}
 
 @app.post("/analyze")
-def analyze_endpoint(payload: RawPayload = Body(...)) -> Dict[str, Any]:
+def analyze_endpoint(payload: Payload = Body(...)) -> Dict[str, Any]:
     try:
         T,O,H,L,C,V,cfg = normalize_payload(payload)
         return analyze_arrays(T,O,H,L,C,V,cfg)
     except Exception as e:
         return {"error": str(e)}
 
-# Alias para compatibilidade (/signal)
 @app.post("/signal")
-def signal_alias(payload: RawPayload = Body(...)) -> Dict[str, Any]:
+def signal_alias(payload: Payload = Body(...)) -> Dict[str, Any]:
     try:
         T,O,H,L,C,V,cfg = normalize_payload(payload)
         return analyze_arrays(T,O,H,L,C,V,cfg)
@@ -526,7 +523,7 @@ def signal_alias(payload: RawPayload = Body(...)) -> Dict[str, Any]:
         return {"error": str(e)}
 
 # -----------------------------
-# Execução local
+# Run local
 # -----------------------------
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=False)
