@@ -3,19 +3,19 @@
 # Execução local:  uvicorn main:app --host 0.0.0.0 --port 8080
 
 from typing import List, Optional, Dict, Any, Literal, Union
-from fastapi import FastAPI, Body, Request
-from pydantic import BaseModel, Field, validator
+from fastapi import FastAPI, Body
+from pydantic import BaseModel, Field
 import numpy as np
 import math
 import uvicorn
 from datetime import datetime, timezone
 import json
 
-app = FastAPI(title="Signals API", version="1.1.1",
+app = FastAPI(title="Signals API", version="1.2.0",
               description="Gera sinais (COMPRA/VENDA/NEUTRO) com indicadores técnicos e previsões curtas.")
 
 # -----------------------------
-# Utilidades numéricas
+# Utils numéricos
 # -----------------------------
 
 def to_float_array(xs: List[str]) -> np.ndarray:
@@ -170,7 +170,7 @@ def try_float(x):
         return None
 
 # -----------------------------
-# Entrada / Config
+# Config
 # -----------------------------
 
 class Config(BaseModel):
@@ -209,72 +209,86 @@ class Config(BaseModel):
     future_max_minutes: int = 30
     forecast_bias: Literal["trend","mean_revert","auto"] = "auto"
 
-class Payload(BaseModel):
-    # Aceita lista OU string (CSV/JSON-string)
-    T: Union[List[str], str] = Field(..., description="Epoch timestamps (segundos)")
-    O: Union[List[str], str]
-    H: Union[List[str], str]
-    C: Union[List[str], str]
-    V: Union[List[str], str]
+# -----------------------------
+# Entrada crua (aceita ambos nomes)
+# -----------------------------
+
+class RawPayload(BaseModel):
+    # nomes clássicos
+    T: Optional[Union[List[str], str]] = None
+    O: Optional[Union[List[str], str]] = None
+    H: Optional[Union[List[str], str]] = None
     L: Optional[Union[List[str], str]] = None
-    I: Optional[Union[List[str], str]] = None  # compat: 'I' como low
+    I: Optional[Union[List[str], str]] = None
+    C: Optional[Union[List[str], str]] = None
+    V: Optional[Union[List[str], str]] = None
+    # nomes do FlutterFlow (seus)
+    saidaInteger: Optional[Union[List[str], str]] = None
+    saidaPrecoAbertura: Optional[Union[List[str], str]] = None
+    saidaPrecoFechamento: Optional[Union[List[str], str]] = None
+    saidaMaximaPeriodo: Optional[Union[List[str], str]] = None
+    saidaMinimaPeriodo: Optional[Union[List[str], str]] = None
+    saidaVolume: Optional[Union[List[str], str]] = None
+
     config: Optional[Config] = None
 
-    @staticmethod
-    def _coerce_to_list_str(v):
-        if v is None:
-            return None
-        if isinstance(v, list):
-            return [str(x) for x in v]
-        if isinstance(v, (int, float)):
-            return [str(v)]
-        if isinstance(v, str):
-            s = v.strip()
-            # JSON-string de array
-            if s.startswith('[') and s.endswith(']'):
-                try:
-                    arr = json.loads(s)
-                    return [str(x) for x in arr]
-                except Exception:
-                    pass
-            # CSV (também aceita ;)
-            parts = [p.strip() for p in s.replace(';', ',').split(',') if p.strip() != ""]
-            return parts
-        # fallback
+# -----------------------------
+# Normalização e parsing
+# -----------------------------
+
+def _coerce_to_list_str(v):
+    """Aceita lista, número, CSV ou JSON-string e devolve List[str]."""
+    if v is None:
+        return None
+    if isinstance(v, list):
+        return [str(x) for x in v]
+    if isinstance(v, (int, float)):
         return [str(v)]
+    if isinstance(v, str):
+        s = v.strip()
+        # JSON-string de array
+        if s.startswith('[') and s.endswith(']'):
+            try:
+                arr = json.loads(s)
+                return [str(x) for x in arr]
+            except Exception:
+                pass
+        # CSV (aceita ';')
+        return [p.strip() for p in s.replace(';', ',').split(',') if p.strip()]
+    return [str(v)]
 
-    @validator("T", "O", "H", "C", "V", "L", "I", pre=True, always=True)
-    def coerce_fields(cls, v):
-        return cls._coerce_to_list_str(v)
+def normalize_payload(p: RawPayload):
+    # escolher fonte por prioridade (clássico → alternativo)
+    T_raw = p.T if p.T is not None else p.saidaInteger
+    O_raw = p.O if p.O is not None else p.saidaPrecoAbertura
+    C_raw = p.C if p.C is not None else p.saidaPrecoFechamento
+    H_raw = p.H if p.H is not None else p.saidaMaximaPeriodo
+    L_raw = p.L if p.L is not None else p.saidaMinimaPeriodo
+    I_raw = p.I  # compat
+    V_raw = p.V if p.V is not None else p.saidaVolume
 
-    @validator("T","O","H","C","V")
-    def same_length_required(cls, v, values, **kwargs):
-        if not isinstance(v, list) or len(v) == 0:
-            raise ValueError("lista vazia")
-        return v
+    T = _coerce_to_list_str(T_raw) or []
+    O = _coerce_to_list_str(O_raw) or []
+    C = _coerce_to_list_str(C_raw) or []
+    H = _coerce_to_list_str(H_raw) or []
+    V = _coerce_to_list_str(V_raw) or []
+
+    # Low pode vir em L (preferido), I (compat) ou saidaMinimaPeriodo
+    if L_raw is not None:
+        L = _coerce_to_list_str(L_raw)
+    elif I_raw is not None:
+        L = _coerce_to_list_str(I_raw)
+    else:
+        L = None
+
+    return T, O, H, L, C, V, (p.config or Config())
 
 # -----------------------------
 # Núcleo de análise
 # -----------------------------
 
-def analyze(data: Payload) -> Dict[str, Any]:
-    # Blindagem extra: sempre coagir para lista, mesmo que Pydantic não tenha feito
-    def as_list_str(x):
-        # reutiliza a mesma lógica do modelo
-        return Payload._coerce_to_list_str(x)
-
-    T_list = as_list_str(data.T)
-    O_list = as_list_str(data.O)
-    H_list = as_list_str(data.H)
-    C_list = as_list_str(data.C)
-    V_list = as_list_str(data.V)
-
-    # Trata 'L' ou 'I' (compat)
-    if data.L is not None:
-        L_list = as_list_str(data.L)
-    elif data.I is not None:
-        L_list = as_list_str(data.I)
-    else:
+def analyze_arrays(T_list, O_list, H_list, L_list, C_list, V_list, cfg: Config) -> Dict[str, Any]:
+    if L_list is None:
         raise ValueError("Forneça 'L' (low) ou 'I' (compatibilidade)")
 
     # Converte para numpy
@@ -285,26 +299,11 @@ def analyze(data: Payload) -> Dict[str, Any]:
     V = to_float_array(V_list)
     L = to_float_array(L_list)
 
-    T = np.array([int(t) for t in data.T], dtype=np.int64)
-    O = to_float_array(data.O)
-    H = to_float_array(data.H)
-    C = to_float_array(data.C)
-    V = to_float_array(data.V)
-
-    if data.L is not None:
-        L = to_float_array(data.L)
-    elif data.I is not None:
-        L = to_float_array(data.I)
-    else:
-        raise ValueError("Forneça 'L' (low) ou 'I' (compatibilidade)")
-
     n = len(T)
     if not (len(O) == len(H) == len(L) == len(C) == len(V) == n):
         raise ValueError("Todos os arrays devem ter o mesmo tamanho")
 
-    cfg = data.config or Config()
-
-    # Indicadores principais
+    # Indicadores
     sma_s = sma(C, cfg.sma_short); sma_l = sma(C, cfg.sma_long)
     ema_s = ema(C, cfg.ema_short); ema_l = ema(C, cfg.ema_long)
     wma_p = wma(C, cfg.wma_period)
@@ -331,7 +330,7 @@ def analyze(data: Payload) -> Dict[str, Any]:
     if ema_slope_val > 0: buy_score += 0.2
     elif ema_slope_val < 0: sell_score += 0.2
 
-    # 2) MACD + hist slope  (corrigido: sem parêntese extra)
+    # 2) MACD + hist slope
     if not math.isnan(macd_line[-1]) and not math.isnan(macd_sig[-1]):
         if macd_line[-1] > macd_sig[-1]:
             buy_score += cfg.w_macd; reasons.append("MACD acima da linha de sinal.")
@@ -341,21 +340,21 @@ def analyze(data: Payload) -> Dict[str, Any]:
         if hsl > 0: buy_score += 0.2
         elif hsl < 0: sell_score += 0.2
 
-    # 3) RSI  (corrigido)
+    # 3) RSI
     if not math.isnan(rsi_val[-1]):
         if rsi_val[-1] < cfg.rsi_buy:
             buy_score += cfg.w_rsi; reasons.append(f"RSI {rsi_val[-1]:.1f} (sobrevendido).")
         elif rsi_val[-1] > cfg.rsi_sell:
             sell_score += cfg.w_rsi; reasons.append(f"RSI {rsi_val[-1]:.1f} (sobrecomprado).")
 
-    # 4) Bollinger  (corrigido)
+    # 4) Bollinger
     if not math.isnan(bb_up[-1]) and not math.isnan(bb_lo[-1]):
         if C[-1] <= bb_lo[-1]:
             buy_score += cfg.w_bb; reasons.append("Preço tocou/abaixo da banda inferior (reversão provável).")
         elif C[-1] >= bb_up[-1]:
             sell_score += cfg.w_bb; reasons.append("Preço tocou/acima da banda superior (reversão provável).")
 
-    # 5) Estocástico  (corrigido)
+    # 5) Estocástico
     if not math.isnan(stoch_k[-1]) and not math.isnan(stoch_d[-1]):
         prev_ok = (len(stoch_k) >= 2 and len(stoch_d) >= 2 and not math.isnan(stoch_k[-2]) and not math.isnan(stoch_d[-2]))
         if (stoch_k[-1] < cfg.stoch_buy) and (prev_ok and stoch_k[-2] <= stoch_d[-2]) and (stoch_k[-1] > stoch_d[-1]):
@@ -417,7 +416,7 @@ def analyze(data: Payload) -> Dict[str, Any]:
         "plus_di": try_float(plus_di[-1]),
         "minus_di": try_float(minus_di[-1]),
         "volume": try_float(V[-1]),
-        "volume_ma": try_float(vol_ma[-1]),
+        "volume_ma": try_float(sma(V, max(5, min(20, n)))[-1]),
         "fib_levels": fibs
     }
 
@@ -510,17 +509,19 @@ def health():
     return {"status": "ok", "utc": datetime.now(timezone.utc).isoformat()}
 
 @app.post("/analyze")
-def analyze_endpoint(payload: Payload = Body(...)) -> Dict[str, Any]:
+def analyze_endpoint(payload: RawPayload = Body(...)) -> Dict[str, Any]:
     try:
-        return analyze(payload)
+        T,O,H,L,C,V,cfg = normalize_payload(payload)
+        return analyze_arrays(T,O,H,L,C,V,cfg)
     except Exception as e:
         return {"error": str(e)}
 
 # Alias para compatibilidade (/signal)
 @app.post("/signal")
-def signal_alias(payload: Payload = Body(...)) -> Dict[str, Any]:
+def signal_alias(payload: RawPayload = Body(...)) -> Dict[str, Any]:
     try:
-        return analyze(payload)
+        T,O,H,L,C,V,cfg = normalize_payload(payload)
+        return analyze_arrays(T,O,H,L,C,V,cfg)
     except Exception as e:
         return {"error": str(e)}
 
@@ -528,5 +529,4 @@ def signal_alias(payload: Payload = Body(...)) -> Dict[str, Any]:
 # Execução local
 # -----------------------------
 if __name__ == "__main__":
-    # Porta padrão 8080 (pode sobrescrever com env PORT ao usar Docker/Render via CMD shell)
     uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=False)
